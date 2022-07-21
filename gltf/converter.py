@@ -1171,10 +1171,7 @@ class Converter():
         else:
             anims = []
 
-        for animid, gltf_anim in anims:
-            anim_name = gltf_anim.get('name', 'anim'+str(animid))
-            #print("\t", anim_name)
-
+        for _, gltf_anim in anims:
             samplers = gltf_anim['samplers']
             channels = gltf_anim['channels']
 
@@ -1193,7 +1190,7 @@ class Converter():
             end_time = time_data[-1]
             fps = num_frames / time_data[-1] if end_time != 0 else 24
 
-            bundle_name = anim_name
+            bundle_name = char.name
             bundle = AnimBundle(bundle_name, fps, num_frames)
 
             if nodeid in self.skeletons and any(chan['target']['path'] != 'weights' for chan in channels):
