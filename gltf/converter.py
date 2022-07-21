@@ -1171,7 +1171,8 @@ class Converter():
         else:
             anims = []
 
-        for _, gltf_anim in anims:
+        for animid, gltf_anim in anims:
+            anim_name = gltf_anim.get('name', 'anim'+str(animid))
             samplers = gltf_anim['samplers']
             channels = gltf_anim['channels']
 
@@ -1204,7 +1205,7 @@ class Converter():
                 self.build_animation_morph(morph, nodeid, num_frames, gltf_anim,
                                            gltf_data, recurse=recurse)
 
-            char.add_child(AnimBundleNode(char.name, bundle))
+            char.add_child(AnimBundleNode(anim_name, bundle))
 
     def combine_mesh_skin(self, geom_node, jvtmap):
         jvtmap = collections.OrderedDict(sorted(jvtmap.items()))
@@ -1898,11 +1899,12 @@ def convert(src, dst, settings=None):
 
     if settings.animations == 'separate':
         for bundlenode in converter.active_scene.find_all_matches('**/+AnimBundleNode'):
-            anim_name = bundlenode.node().bundle.name
+            anim_name = bundlenode.node().name
             anim_dst = dst.get_fullpath_wo_extension() \
                 + f'_{anim_name}.' \
                 + dst.get_extension()
             bundlenode.write_bam_file(anim_dst)
+            bundlenode.removeNode()
     converter.active_scene.write_bam_file(dst)
 
 
