@@ -33,6 +33,6 @@ def test_load_actor(modelroot):
     assert actor
 
     print(actor.getAnimNames())
-    assert 'Walk' in actor.getAnimNames()
+    assert 'fox' in actor.getAnimNames()
 
-    actor.play('Walk')
+    actor.play('fox')
