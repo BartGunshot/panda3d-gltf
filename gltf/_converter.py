@@ -1,21 +1,37 @@
+from __future__ import annotations
+
 import base64
 import collections
 import itertools
-import json
 import os
 import math
-import shutil
 import struct
-import tempfile
+import urllib.parse
 import pprint # pylint: disable=unused-import
 
+from dataclasses import dataclass
+
 from panda3d.core import * # pylint: disable=wildcard-import
+import panda3d.core as p3d
 try:
     from panda3d import bullet
     HAVE_BULLET = True
 except ImportError:
     HAVE_BULLET = False
 from direct.stdpy.file import open # pylint: disable=redefined-builtin
+
+from ._converter_maps import (
+    ATTRIB_CONTENT_MAP,
+    ATTRIB_NAME_MAP,
+    COMPONENT_FORMT_STR_MAP,
+    COMPONENT_NUM_MAP,
+    COMPONENT_SIZE_MAP,
+    COMPONENT_TYPE_MAP,
+    MAG_FILTER_MAP,
+    MIN_FILTER_MAP,
+    PRIMITIVE_MODE_MAP,
+    WRAP_MODE_MAP,
+)
 
 if LVector3 is LVector3f:
     CPTA_stdfloat = CPTA_float
@@ -24,88 +40,97 @@ else:
     CPTA_stdfloat = CPTA_double
     PTA_stdfloat = PTA_double
 
-load_prc_file_data(
-    '',
-    'interpolate-frames #t\n'
-)
 
-GltfSettings = collections.namedtuple('GltfSettings', (
-    'physics_engine',
-    'print_scene',
-    'skip_axis_conversion',
-    'no_srgb',
-    'textures',
-    'legacy_materials',
-    'animations',
-))
-GltfSettings.__new__.__defaults__ = (
-    'builtin', # physics engine
-    False, # print_scene
-    False, # skip_axis_conversion
-    False, # do not load textures as sRGB
-    'ref', # reference external textures
-    False, # use PBR materials
-    'embed', # keep animations in the same BAM file
-)
+@dataclass
+class GltfSettings:
+    collision_shapes: str = 'builtin'
+    skip_axis_conversion: bool = False
+    no_srgb: bool = False
+    legacy_materials: bool = False
+    skip_animations: bool = False
+    flatten_nodes: bool = False
+    animation_fps: int = 30
+
+
+def get_extras(gltf_data):
+    extras = gltf_data.get('extras', {})
+    if not isinstance(extras, dict):
+        # weird, but legal; fail silently for now
+        return {}
+    return extras
+
+def vlerp(veca: p3d.LVector3, vecb: p3d.LVector3, factor: float) -> p3d.LVector3:
+    return veca * (1.0 - factor) + vecb * factor
+
+
+def slerp(quata: p3d.LQuaternion, quatb: p3d.LQuaternion, factor: float) -> p3d.LQuaternion:
+    dot_product = quata.dot(quatb)
+
+    if dot_product < 0.0:
+        # take shorted path for negative dot product
+        quata = -quata
+        dot_product = -dot_product
+
+    if dot_product > 0.9995:
+        # close enough; just lerp
+        retval = quata * (1.0 - factor) + quatb * factor
+        retval.normalize()
+        return retval
+
+    # spherical linear interpolation
+    theta0 = math.acos(dot_product)
+    theta = factor * theta0
+    sin_theta = math.sin(theta)
+    sin_theta0 = math.sin(theta0)
+
+    scale_quata = math.cos(theta) - dot_product * sin_theta / sin_theta0
+    scale_quatb = sin_theta / sin_theta0
+
+    return quata * scale_quata + quatb * scale_quatb
+
+
+def get_next_time_index(currtime: float, time_buffer: 'list[float]') -> int:
+    nextidx = 1
+    nexttime = time_buffer[nextidx]
+    while currtime > nexttime and nextidx < len(time_buffer):
+        nextidx += 1
+        nexttime = time_buffer[nextidx]
+
+    return nextidx
+
+
+def get_lerp_factor(currtime: float, lasttime: float, nexttime: float) -> float:
+    return max((currtime - lasttime) / (nexttime - lasttime), 1)
+
+
+@dataclass
+class CharInfo:
+    character: p3d.Character
+    nodepath: p3d.NodePath
+    jvtmap: 'dict[int, p3d.JointVertexTransform]'
+    cvsmap: 'dict[tuple[int, str], p3d.CharacterVertexSlider]'
+
+    def __init__(self, name: str):
+        self.character = p3d.Character(name)
+        self.nodepath = p3d.NodePath(self.character)
+        self.jvtmap = {}
+        self.cvsmap = {}
 
 
 class Converter():
-    _COMPONENT_TYPE_MAP = {
-        5120: GeomEnums.NT_int8,
-        5121: GeomEnums.NT_uint8,
-        5122: GeomEnums.NT_int16,
-        5123: GeomEnums.NT_uint16,
-        5124: GeomEnums.NT_int32,
-        5125: GeomEnums.NT_uint32,
-        5126: GeomEnums.NT_float32,
-    }
-    _COMPONENT_SIZE_MAP = {
-        5120: 1,
-        5121: 1,
-        5122: 2,
-        5123: 2,
-        5124: 4,
-        5125: 4,
-        5126: 4,
-    }
-    _COMPONENT_NUM_MAP = {
-        'MAT4': 16,
-        'VEC4': 4,
-        'VEC3': 3,
-        'VEC2': 2,
-        'SCALAR': 1,
-    }
-    _ATTRIB_CONTENT_MAP = {
-        'vertex': GeomEnums.C_point,
-        'normal': GeomEnums.C_normal,
-        'tangent': GeomEnums.C_other,
-        'texcoord': GeomEnums.C_texcoord,
-        'color': GeomEnums.C_color,
-        'transform_weight': GeomEnums.C_other,
-        'transform_index': GeomEnums.C_index,
-    }
-    _ATTRIB_NAME_MAP = {
-        'position': InternalName.get_vertex().get_name(),
-        'weights': InternalName.get_transform_weight().get_name(),
-        'joints': InternalName.get_transform_index().get_name(),
-    }
-    _PRIMITIVE_MODE_MAP = {
-        0: GeomPoints,
-        1: GeomLines,
-        3: GeomLinestrips,
-        4: GeomTriangles,
-        5: GeomTristrips,
-        6: GeomTrifans,
-    }
+
 
     def __init__(
             self,
-            indir=Filename.from_os_specific(os.getcwd()),
-            outdir=Filename.from_os_specific(os.getcwd()),
-            settings=GltfSettings()
+            filepath,
+            settings=None
     ):
-        self.indir = indir
-        self.outdir = outdir
+        if not isinstance(filepath, Filename):
+            filepath = Filename.from_os_specific(filepath)
+        if settings is None:
+            settings = GltfSettings()
+        self.filepath = filepath
+        self.filedir = Filename(filepath.get_dirname())
         self.settings = settings
         self.cameras = {}
         self.buffers = {}
@@ -114,10 +139,10 @@ class Converter():
         self.mat_states = {}
         self.mat_mesh_map = {}
         self.meshes = {}
-        self.node_paths = {}
         self.scenes = {}
         self.skeletons = {}
         self.joint_parents = {}
+        self.characters = {}
 
         # Coordinate system transform matrix
         self.csxform = LMatrix4.convert_mat(CS_yup_right, CS_default)
@@ -131,7 +156,7 @@ class Converter():
         self.background_color = (0, 0, 0)
         self.active_camera = None
 
-    def update(self, gltf_data, writing_bam=False):
+    def update(self, gltf_data):
         #pprint.pprint(gltf_data)
 
         skip_axis_conversion = (
@@ -174,35 +199,7 @@ class Converter():
         for meshid, gltf_mesh in enumerate(gltf_data.get('meshes', [])):
             self.load_mesh(meshid, gltf_mesh, gltf_data)
 
-        # If we support writing bam 6.40, we can safely write out
-        # instanced lights.  If not, we have to copy it.
-        copy_lights = writing_bam and not hasattr(BamWriter, 'root_node')
-
-        # Build scenegraphs
-        def add_node(root, gltf_scene, nodeid, jvtmap, cvsmap):
-            try:
-                gltf_node = gltf_data['nodes'][nodeid]
-            except IndexError:
-                print("Could not find node with index: {}".format(nodeid))
-                return
-
-            node_name = gltf_node.get('name', 'node'+str(nodeid))
-            if nodeid in self._joint_nodes:
-                # Handle non-joint children of joints, but don't add joints themselves
-                for child_nodeid in gltf_node.get('children', []):
-                    add_node(root, gltf_scene, child_nodeid, jvtmap, cvsmap)
-                return
-
-            jvtmap = dict(jvtmap)
-            cvsmap = dict(cvsmap)
-
-            if nodeid in self.skeletons:
-                # This node is the root of an animated character.
-                panda_node = Character(node_name)
-            else:
-                panda_node = PandaNode(node_name)
-
-            # Determine the transformation.
+        def get_node_transform(gltf_node):
             if 'matrix' in gltf_node:
                 gltf_mat = LMatrix4(*gltf_node.get('matrix'))
             else:
@@ -220,16 +217,56 @@ class Converter():
                 if 'translation' in gltf_node:
                     gltf_mat *= LMatrix4.translate_mat(*gltf_node['translation'])
 
-            panda_node.set_transform(TransformState.make_mat(self.csxform_inv * gltf_mat * self.csxform))
+            return TransformState.make_mat(self.csxform_inv * gltf_mat * self.csxform)
 
-            np = self.node_paths.get(nodeid, root.attach_new_node(panda_node))
-            self.node_paths[nodeid] = np
+        def build_characters(nodeid):
+            try:
+                gltf_node = gltf_data['nodes'][nodeid]
+            except IndexError:
+                print(f"Could not find node with index: {nodeid}")
+                return
+            node_name = gltf_node.get('name', 'node'+str(nodeid))
 
             if nodeid in self.skeletons:
-                self.build_character(panda_node, nodeid, jvtmap, cvsmap, gltf_data)
+                skinid = self.skeletons[nodeid]
+                charinfo = CharInfo(node_name)
+                charinfo.character.set_transform(get_node_transform(gltf_node))
+                self.build_character(charinfo, nodeid, gltf_data, recurse=True)
+                self.characters[skinid] = charinfo
 
-            if 'extras' in gltf_scene and 'hidden_nodes' in gltf_scene['extras']:
-                if nodeid in gltf_scene['extras']['hidden_nodes']:
+            for child_nodeid in gltf_node.get('children', []):
+                build_characters(child_nodeid)
+
+        # Build scenegraphs
+        def add_node(root, gltf_scene, nodeid):
+            try:
+                gltf_node = gltf_data['nodes'][nodeid]
+            except IndexError:
+                print(f"Could not find node with index: {nodeid}")
+                return
+
+            skinid = self.skeletons.get(nodeid, None)
+            charinfo = self.characters.get(skinid, None)
+            scene_extras = get_extras(gltf_scene)
+            node_name = gltf_node.get('name', 'node'+str(nodeid))
+            if nodeid in self._joint_nodes and not nodeid in self.skeletons:
+                # Handle non-joint children of joints, but don't add joints themselves
+                for child_nodeid in gltf_node.get('children', []):
+                    add_node(root, gltf_scene, child_nodeid)
+                return
+
+            if charinfo:
+                # This node is the root of an animated character.
+                panda_node = charinfo.character
+                np = charinfo.nodepath
+                np.reparent_to(root)
+            else:
+                panda_node = PandaNode(node_name)
+                panda_node.set_transform(get_node_transform(gltf_node))
+                np = root.attach_new_node(panda_node)
+
+            if 'hidden_nodes' in scene_extras:
+                if nodeid in scene_extras['hidden_nodes']:
                     panda_node = panda_node.make_copy()
 
             if 'mesh' in gltf_node:
@@ -237,22 +274,25 @@ class Converter():
                 gltf_mesh = gltf_data['meshes'][meshid]
                 mesh = self.meshes[meshid]
 
+                charinfo = None
+                if "skin" in gltf_node:
+                    skinid = gltf_node["skin"]
+                    charinfo = self.characters[skinid]
+
                 # Does this mesh have weights, but are we not under a character?
                 # If so, create a character just for this mesh.
-                if gltf_mesh.get('weights') and not jvtmap and not cvsmap:
+                if gltf_mesh.get('weights') and not charinfo:
                     mesh_name = gltf_mesh.get('name', 'mesh'+str(meshid))
-                    char = Character(mesh_name)
-                    cvsmap2 = {}
-                    self.build_character(char, nodeid, {}, cvsmap2, gltf_data, recurse=False)
-                    self.combine_mesh_morphs(mesh, meshid, cvsmap2)
-
-                    np.attach_new_node(char).attach_new_node(mesh)
+                    charinfo = CharInfo(mesh_name)
+                    self.build_character(charinfo, nodeid, gltf_data, recurse=False)
+                    self.combine_mesh_morphs(mesh, meshid, charinfo)
+                    charinfo.nodepath.reparent_to(np)
+                    charinfo.nodepath.attach_new_node(mesh)
                 else:
                     np.attach_new_node(mesh)
-                    if jvtmap:
-                        self.combine_mesh_skin(mesh, jvtmap)
-                    if cvsmap:
-                        self.combine_mesh_morphs(mesh, meshid, cvsmap)
+                    if charinfo:
+                        self.combine_mesh_skin(mesh, charinfo)
+                        self.combine_mesh_morphs(mesh, meshid, charinfo)
 
             if 'camera' in gltf_node:
                 camid = gltf_node['camera']
@@ -270,8 +310,6 @@ class Converter():
                 if has_light_ext:
                     lightid = gltf_node['extensions'][light_ext]['light']
                     light = self.lights[lightid]
-                    if copy_lights:
-                        light = light.make_copy()
                     lnp = np.attach_new_node(light)
                     if self.compose_cs == CS_zup_right:
                         lnp.set_p(lnp.get_p() - 90)
@@ -295,7 +333,10 @@ class Converter():
                     else:
                         collision_shape = gltf_collisions['collisionShapes'][0]
                         shape_type = collision_shape['shapeType']
-                    bounding_box = collision_shape['boundingBox']
+                    bounding_box = [
+                        max(0.00001, i)
+                        for i in collision_shape['boundingBox']
+                    ]
                     radius = max(bounding_box[0], bounding_box[1]) / 2.0
                     height = bounding_box[2]
                     geomnode = None
@@ -305,15 +346,14 @@ class Converter():
                             geomnode = self.meshes[collision_shape['mesh']]
                         except KeyError:
                             print(
-                                "Could not find physics mesh ({}) for object ({})"
-                                .format(collision_shape['mesh'], nodeid)
+                                f"Could not find physics mesh ({collision_shape['mesh']}) for object ({nodeid})"
                             )
                     if 'extensions' in gltf_data and 'BP_physics_engine' in gltf_data['extensions']:
                         use_bullet = (
                             gltf_data['extensions']['BP_physics_engine']['engine'] == 'bullet'
                         )
                     else:
-                        use_bullet = self.settings.physics_engine == 'bullet'
+                        use_bullet = self.settings.collision_shapes == 'bullet'
                     if use_bullet and not HAVE_BULLET:
                         print(
                             'Warning: attempted to export for Bullet, which is unavailable, falling back to builtin'
@@ -345,13 +385,12 @@ class Converter():
                         phynp = np.attach_new_node(phynode)
                         for geomnode in np.find_all_matches('+GeomNode'):
                             geomnode.reparent_to(phynp)
-            if 'extras' in gltf_node:
-                for key, value in gltf_node['extras'].items():
-                    np.set_tag(key, str(value))
 
+            for key, value in get_extras(gltf_node).items():
+                np.set_tag(key, str(value))
 
             for child_nodeid in gltf_node.get('children', []):
-                add_node(np, gltf_scene, child_nodeid, jvtmap, cvsmap)
+                add_node(np, gltf_scene, child_nodeid)
 
             # Handle visibility after children are loaded
             def visible_recursive(node, visible):
@@ -361,13 +400,14 @@ class Converter():
                     node.hide()
                 for child in node.get_children():
                     visible_recursive(child, visible)
-            if 'extras' in gltf_scene and 'hidden_nodes' in gltf_scene['extras']:
-                if nodeid in gltf_scene['extras']['hidden_nodes']:
-                    #print('Hiding', np)
-                    visible_recursive(np, False)
-                else:
-                    #print('Showing', np)
-                    visible_recursive(np, True)
+
+            hidden_nodes = scene_extras.get('hidden_nodes', [])
+            if nodeid in hidden_nodes:
+                #print('Hiding', np)
+                visible_recursive(np, False)
+            else:
+                #print('Showing', np)
+                visible_recursive(np, True)
 
             # Check if we need to deal with negative scale values
             scale = panda_node.get_transform().get_scale()
@@ -381,20 +421,33 @@ class Converter():
             # Handle parenting to joints
             joint = self.joint_parents.get(nodeid)
             if joint:
-                xformnp = root.attach_new_node(PandaNode('{}-parent'.format(node_name)))
+                xformnp = root.attach_new_node(PandaNode(f'{node_name}-parent'))
                 np.reparent_to(xformnp)
                 joint.add_net_transform(xformnp.node())
+
+            # if the NodePath children were moved under a Character and has no other children,
+            # then we can safely delete the NodePath
+            if charinfo and not np.children:
+                np.remove_node()
 
         for sceneid, gltf_scene in enumerate(gltf_data.get('scenes', [])):
             scene_name = gltf_scene.get('name', 'scene'+str(sceneid))
             scene_root = NodePath(ModelRoot(scene_name))
 
             node_list = gltf_scene['nodes']
-            if 'extras' in gltf_scene and 'hidden_nodes' in gltf_scene['extras']:
-                node_list += gltf_scene['extras']['hidden_nodes']
+            hidden_nodes = get_extras(gltf_scene).get('hidden_nodes', [])
+            node_list += hidden_nodes
 
+            # Run through and pre-build Characters
             for nodeid in node_list:
-                add_node(scene_root, gltf_scene, nodeid, {}, {})
+                build_characters(nodeid)
+
+            # Now iterate again to build the scene graph
+            for nodeid in node_list:
+                add_node(scene_root, gltf_scene, nodeid)
+
+            if self.settings.flatten_nodes:
+                scene_root.flatten_medium()
 
             self.scenes[sceneid] = scene_root
 
@@ -404,11 +457,11 @@ class Converter():
             self.active_scene = self.scenes[sceneid]
         if 'scenes' in gltf_data:
             gltf_scene = gltf_data['scenes'][sceneid]
-            if 'extras' in gltf_scene:
-                if 'background_color' in gltf_scene['extras']:
-                    self.background_color = gltf_scene['extras']['background_color']
-                if 'active_camera' in gltf_scene['extras']:
-                    self.active_camera = gltf_scene['extras']['active_camera']
+            scene_extras = get_extras(gltf_scene)
+            if 'background_color' in scene_extras:
+                self.background_color = scene_extras['background_color']
+            if 'active_camera' in scene_extras:
+                self.active_camera = scene_extras['active_camera']
 
     def load_matrix(self, mat):
         lmat = LMatrix4()
@@ -423,18 +476,19 @@ class Converter():
             return
 
         uri = gltf_buffer['uri']
-        if uri.startswith('data:application/octet-stream;base64') or \
+        if uri == '_glb_bin' and buffid == 0:
+            buff_data = gltf_buffer['_glb_bin']
+        elif uri.startswith('data:application/octet-stream;base64') or \
            uri.startswith('data:application/gltf-buffer;base64'):
             buff_data = gltf_buffer['uri'].split(',')[1]
             buff_data = base64.b64decode(buff_data)
         elif uri.endswith('.bin'):
-            buff_fname = os.path.join(self.indir.to_os_specific(), uri)
+            buff_fname = os.path.join(self.filedir.to_os_specific(), uri)
             with open(buff_fname, 'rb') as buff_file:
                 buff_data = buff_file.read(gltf_buffer['byteLength'])
         else:
             print(
-                "Buffer {} has an unsupported uri ({}), using a zero filled buffer instead"
-                .format(buffid, uri)
+                "Buffer {buffid} has an unsupported uri ({uri}), using a zero filled buffer instead"
             )
             buff_data = bytearray(gltf_buffer['byteLength'])
         self.buffers[buffid] = buff_data
@@ -444,10 +498,44 @@ class Converter():
         buff = self.buffers[buffview['buffer']]
         start = buffview.get('byteOffset', 0)
         end = start + buffview['byteLength']
-        if 'byteStride' in buffview:
-            return memoryview(buff)[start:end:buffview['byteStride']]
+        stride = buffview.get('byteStride', 1)
+        return memoryview(buff)[start:end:stride]
+
+    def get_buffer_from_accessor(self, gltf_data, accid, unpack=True):
+        acc = gltf_data['accessors'][accid]
+        viewid = acc['bufferView']
+        buff_view = self.get_buffer_view(gltf_data, viewid)
+        if 'byteOffset' in acc:
+            buff_view = buff_view[acc['byteOffset']:]
+
+        formatstr = (
+            COMPONENT_FORMT_STR_MAP[acc['componentType']]
+            * COMPONENT_NUM_MAP[acc['type']]
+        )
+
+        convertfn = lambda x: x
+
+        acctype = acc['type']
+        if acctype == 'SCALAR':
+            convertfn = lambda x: x[0]
+        elif acctype == 'VEC2':
+            convertfn = lambda x: p3d.LVector2(*x)
+        elif acctype == 'VEC3':
+            convertfn = lambda x: p3d.LVector3(*x)
+        elif acctype == 'VEC4':
+            convertfn = lambda x: p3d.LVector4(*x)
+
+        element_size = (
+            COMPONENT_SIZE_MAP[acc['componentType']]
+            * COMPONENT_NUM_MAP[acc['type']]
+        )
+        end = acc['count'] * element_size
+        buffdata = buff_view[:end]
+
+        if unpack:
+            return list(map(convertfn, struct.iter_unpack(f'<{formatstr}', buffdata)))
         else:
-            return memoryview(buff)[start:end]
+            return buffdata
 
     def make_texture_srgb(self, texture):
         if self.settings.no_srgb:
@@ -484,96 +572,94 @@ class Converter():
 
     def load_texture(self, texid, gltf_tex, gltf_data):
         if 'source' not in gltf_tex:
-            print("Texture '{}' has no source, skipping".format(texid))
+            print(f"Texture '{texid}' has no source, skipping")
             return
+
+        def load_embedded_image(name, ext, data):
+            if not name:
+                name = f'gltf-embedded-{texid}'
+            img_type_registry = PNMFileTypeRegistry.get_global_ptr()
+            img_type = img_type_registry.get_type_from_extension(ext)
+
+            img = PNMImage()
+            img.read(StringStream(data), type=img_type)
+
+            texture = Texture(name)
+            texture.load(img)
+
+            return texture
 
         source = gltf_data['images'][gltf_tex['source']]
         if 'uri' in source:
             uri = source['uri']
-            def write_tex_image(ext):
-                texname = 'tex{}.{}'.format(gltf_tex['source'], ext)
-                texdata = base64.b64decode(uri.split(',')[1])
-                texfname = os.path.join(self.outdir.to_os_specific(), texname)
-                with open(texfname, 'wb') as texfile:
-                    texfile.write(texdata)
-                return texfname
-            if uri.startswith('data:image/png;base64'):
-                uri = write_tex_image('png')
-            elif uri.startswith('data:image/jpeg;base64'):
-                uri = write_tex_image('jpeg')
+            if uri.startswith('data:'):
+                info, b64data = uri.split(',')
+
+                if not (info.startswith('data:image/') and info.endswith(';base64')):
+                    raise RuntimeError(
+                        f'Unknown data URI: {info}'
+                    )
+
+                name = source.get('name', '')
+                ext = info.replace('data:image/', '').replace(';base64', '')
+                data = base64.b64decode(b64data)
+
+                texture = load_embedded_image(name, ext, data)
             else:
-                uri = Filename.fromOsSpecific(uri)
-                if self.settings.textures == 'copy':
-                    src = os.path.join(self.indir.to_os_specific(), uri)
-                    dst = os.path.join(self.outdir.to_os_specific(), uri)
-                    outdir = os.path.dirname(dst)
-                    os.makedirs(outdir, exist_ok=True)
-                    shutil.copy(src, dst)
-            texture = TexturePool.load_texture(uri, 0, False, LoaderOptions())
+                uri = urllib.parse.unquote(uri)
+                fname = Filename.from_os_specific(uri)
+                if not os.path.isabs(uri):
+                    fulluri = Filename(self.filedir, uri)
+                else:
+                    fulluri = fname
+                texture = TexturePool.load_texture(fulluri, 0, False, LoaderOptions())
+                if not texture:
+                    raise RuntimeError(f'failed to load texture: {fulluri}')
+                texture.filename = uri
         else:
-            view = self.get_buffer_view(gltf_data, source['bufferView'])
+            name = source.get('name', '')
             ext = source['mimeType'].split('/')[1]
-            img_type = PNMFileTypeRegistry.get_global_ptr().get_type_from_extension(ext)
-            img = PNMImage()
-            img.read(StringStream(view), type=img_type)
-            texture = Texture(source.get('name', ''))
-            texture.load(img)
+            data = self.get_buffer_view(gltf_data, source['bufferView'])
+            texture = load_embedded_image(name, ext, data)
 
         if 'sampler' in gltf_tex:
             gltf_sampler = gltf_data['samplers'][gltf_tex['sampler']]
-            if 'magFilter' in gltf_sampler:
-                if gltf_sampler['magFilter'] == 9728:
-                    texture.set_magfilter(SamplerState.FT_nearest)
-                elif gltf_sampler['magFilter'] == 9729:
-                    texture.set_magfilter(SamplerState.FT_linear)
-                else:
+            gltf_magfilter = gltf_sampler.get('magFilter', None)
+            if gltf_magfilter:
+                try:
+                    magfilter = MAG_FILTER_MAP[gltf_magfilter]
+                    texture.set_magfilter(magfilter)
+                except KeyError:
                     print(
-                        "Sampler {} has unsupported magFilter type {}"
-                        .format(gltf_tex['sampler'], gltf_sampler['magFilter'])
-                    )
-            if 'minFilter' in gltf_sampler:
-                if gltf_sampler['minFilter'] == 9728:
-                    texture.set_minfilter(SamplerState.FT_nearest)
-                elif gltf_sampler['minFilter'] == 9729:
-                    texture.set_minfilter(SamplerState.FT_linear)
-                elif gltf_sampler['minFilter'] == 9984:
-                    texture.set_minfilter(SamplerState.FT_nearest_mipmap_nearest)
-                elif gltf_sampler['minFilter'] == 9985:
-                    texture.set_minfilter(SamplerState.FT_linear_mipmap_nearest)
-                elif gltf_sampler['minFilter'] == 9986:
-                    texture.set_minfilter(SamplerState.FT_nearest_mipmap_linear)
-                elif gltf_sampler['minFilter'] == 9987:
-                    texture.set_minfilter(SamplerState.FT_linear_mipmap_linear)
-                else:
-                    print(
-                        "Sampler {} has unsupported minFilter type {}"
-                        .format(gltf_tex['sampler'], gltf_sampler['minFilter'])
+                        f"Sampler {gltf_tex['sampler']} has unsupported magFilter type {gltf_sampler['magFilter']}"
                     )
 
-            wraps = gltf_sampler.get('wrapS', 10497)
-            if wraps == 33071:
-                texture.set_wrap_u(SamplerState.WM_clamp)
-            elif wraps == 33648:
-                texture.set_wrap_u(SamplerState.WM_mirror)
-            elif wraps == 10497:
-                texture.set_wrap_u(SamplerState.WM_repeat)
-            else:
+            gltf_minfilter = gltf_sampler.get('minFilter', None)
+            if gltf_minfilter:
+                try:
+                    minfilter = MIN_FILTER_MAP[gltf_minfilter]
+                    texture.set_minfilter(minfilter)
+                except KeyError:
+                    print(
+                        f"Sampler {gltf_tex['sampler']} has unsupported minFilter type {gltf_sampler['minFilter']}"
+                    )
+
+            gltf_wraps = gltf_sampler.get('wrapS', 10497)
+            try:
+                wraps = WRAP_MODE_MAP[gltf_wraps]
+                texture.set_wrap_u(wraps)
+            except KeyError:
                 print(
-                    "Sampler {} has unsupported wrapS type {}"
-                    .format(gltf_tex['sampler'], gltf_sampler['wrapS'])
+                    f"Sampler {gltf_tex['sampler']} has unsupported wrapS type {gltf_wraps}"
                 )
 
-            wrapt = gltf_sampler.get('wrapT', 10497)
-            if wrapt == 33071:
-                texture.set_wrap_v(SamplerState.WM_clamp)
-            elif wrapt == 33648:
-                texture.set_wrap_v(SamplerState.WM_mirror)
-            elif wrapt == 10497:
-                texture.set_wrap_v(SamplerState.WM_repeat)
-            else:
+            gltf_wrapt = gltf_sampler.get('wrapT', 10497)
+            try:
+                wrapt = WRAP_MODE_MAP[gltf_wrapt]
+                texture.set_wrap_v(wrapt)
+            except KeyError:
                 print(
-                    "Sampler {} has unsupported wrapT type {}"
-                    .format(gltf_tex['sampler'], gltf_sampler['wrapT'])
+                    f"Sampler {gltf_tex['sampler']} has unsupported wrapT type {gltf_wrapt}"
                 )
 
         self.textures[texid] = texture
@@ -605,8 +691,9 @@ class Converter():
             texinfos.append(gltf_mat.get('normalTexture', normal_fallback))
             texinfos[-1]['mode'] = TextureStage.M_normal
         else:
-            if 'extensions' in gltf_mat and 'BP_materials_legacy' in gltf_mat['extensions']:
-                matsettings = gltf_mat['extensions']['BP_materials_legacy']['bpLegacy']
+            mat_extensions = gltf_mat.get('extensions', {})
+            if 'BP_materials_legacy' in mat_extensions:
+                matsettings = mat_extensions['BP_materials_legacy']['bpLegacy']
                 pmat.set_shininess(matsettings['shininessFactor'])
                 pmat.set_ambient(LColor(*matsettings['ambientFactor']))
 
@@ -659,6 +746,10 @@ class Converter():
             if texinfos[-1]['index'] in self.textures:
                 self.make_texture_srgb(self.textures[texinfos[-1]['index']])
 
+            # Index of refraction
+            ior_ext = mat_extensions.get('KHR_materials_ior', {})
+            pmat.set_refractive_index(ior_ext.get('ior', 1.5))
+
         double_sided = gltf_mat.get('doubleSided', False)
         pmat.set_twoside(double_sided)
 
@@ -673,7 +764,7 @@ class Converter():
         for i, texinfo in enumerate(texinfos):
             texdata = self.textures.get(texinfo['index'], None)
             if texdata is None:
-                print("Could not find texture for key: {}".format(texinfo['index']))
+                print(f"Could not find texture for key: {texinfo['index']}")
                 continue
 
             texstage = TextureStage(str(i))
@@ -728,8 +819,7 @@ class Converter():
             state = state.set_attrib(transp_attrib)
         elif alpha_mode != 'OPAQUE':
             print(
-                "Warning: material {} has an unsupported alphaMode: {}"
-                .format(matid, alpha_mode)
+                f"Warning: material {matid} has an unsupported alphaMode: {alpha_mode}"
             )
 
         # Remove stale meshes
@@ -790,7 +880,7 @@ class Converter():
         # Check for morph target columns.
         targets = gltf_primitive.get('targets')
         if targets:
-            target_names = gltf_mesh.get('extras', {}).get('targetNames', [])
+            target_names = get_extras(gltf_mesh).get('targetNames', [])
 
             for i, target in enumerate(targets):
                 if i < len(target_names):
@@ -819,15 +909,15 @@ class Converter():
             for acc in accs:
                 # Gather column information
                 attrib_parts = acc['_attrib'].lower().split('_')
-                attrib_name = self._ATTRIB_NAME_MAP.get(attrib_parts[0], attrib_parts[0])
+                attrib_name = ATTRIB_NAME_MAP.get(attrib_parts[0], attrib_parts[0])
                 if attrib_name == 'texcoord' and len(attrib_parts) > 1:
                     internal_name = InternalName.make(attrib_name+'.', int(attrib_parts[1]))
                 else:
                     internal_name = InternalName.make(attrib_name)
-                num_components = self._COMPONENT_NUM_MAP[acc['type']]
-                numeric_type = self._COMPONENT_TYPE_MAP[acc['componentType']]
-                numeric_size = self._COMPONENT_SIZE_MAP[acc['componentType']]
-                content = self._ATTRIB_CONTENT_MAP.get(attrib_name, GeomEnums.C_other)
+                num_components = COMPONENT_NUM_MAP[acc['type']]
+                numeric_type = COMPONENT_TYPE_MAP[acc['componentType']]
+                numeric_size = COMPONENT_SIZE_MAP[acc['componentType']]
+                content = ATTRIB_CONTENT_MAP.get(attrib_name, GeomEnums.C_other)
                 size = numeric_size * num_components
 
                 if '_target' in acc:
@@ -929,6 +1019,7 @@ class Converter():
         vformat = GeomVertexFormat()
         varray_vert = GeomVertexArrayFormat()
         varray_skin = GeomVertexArrayFormat()
+        varray_morph = GeomVertexArrayFormat()
 
         skip_columns = (
             InternalName.get_transform_index(),
@@ -937,9 +1028,15 @@ class Converter():
         )
         for arr in reg_format.get_arrays():
             for column in arr.get_columns():
-                varray = varray_skin if column.get_name() in skip_columns else varray_vert
+                column_name = column.get_name()
+                if column_name in skip_columns:
+                    varray = varray_skin
+                elif column_name.parent.basename == "morph":
+                    varray = varray_morph
+                else:
+                    varray = varray_vert
                 varray.add_column(
-                    column.get_name(),
+                    column_name,
                     column.get_num_components(),
                     column.get_numeric_type(),
                     column.get_contents()
@@ -958,6 +1055,9 @@ class Converter():
             vformat.add_array(varray_blends)
             vformat.add_array(varray_skin)
 
+        if targets:
+            vformat.add_array(varray_morph)
+
         reg_format = GeomVertexFormat.register_format(vformat)
         vdata = vdata.convert_to(reg_format)
 
@@ -965,26 +1065,22 @@ class Converter():
         primitiveid = geom_node.get_num_geoms()
         primitivemode = gltf_primitive.get('mode', 4)
         try:
-            prim = self._PRIMITIVE_MODE_MAP[primitivemode](GeomEnums.UH_static)
+            prim = PRIMITIVE_MODE_MAP[primitivemode](GeomEnums.UH_static)
         except KeyError:
             print(
-                "Warning: primitive {} on mesh {} has an unsupported mode: {}"
-                .format(primitiveid, geom_node.name, primitivemode)
+                f"Warning: primitive {primitiveid} on mesh {geom_node.name} has an unsupported mode: {primitivemode}"
             )
             return
 
         if 'indices' in gltf_primitive:
-            index_acc = gltf_data['accessors'][gltf_primitive['indices']]
-            prim.set_index_type(self._COMPONENT_TYPE_MAP[index_acc['componentType']])
+            index_accid = gltf_primitive['indices']
+            index_acc = gltf_data['accessors'][index_accid]
+            num_elements = index_acc['count']
+            prim.set_index_type(COMPONENT_TYPE_MAP[index_acc['componentType']])
 
-            handle = prim.modify_vertices(index_acc['count']).modify_handle()
-            handle.unclean_set_num_rows(index_acc['count'])
-
-            buffview = gltf_data['bufferViews'][index_acc['bufferView']]
-            buff = self.buffers[buffview['buffer']]
-            start = buffview.get('byteOffset', 0) + index_acc.get('byteOffset', 0)
-            end = start + index_acc['count'] * buffview.get('byteStride', 1) * prim.index_stride
-            handle.copy_data_from(buff[start:end])
+            handle = prim.modify_vertices(num_elements).modify_handle()
+            handle.unclean_set_num_rows(num_elements)
+            handle.copy_data_from(self.get_buffer_from_accessor(gltf_data, index_accid, unpack=False))
             handle = None
         else:
             index_acc = gltf_data['accessors'][gltf_primitive['attributes']["POSITION"]]
@@ -995,8 +1091,7 @@ class Converter():
         matid = gltf_primitive.get('material', None)
         if matid is None:
             print(
-                "Warning: mesh {} has a primitive with no material, using an empty RenderState"
-                .format(geom_node.name)
+                f"Warning: mesh {geom_node.name} has a primitive with no material, using an empty RenderState"
             )
             pmat = Material('fallback material')
             matattrib = MaterialAttrib.make(pmat)
@@ -1004,8 +1099,7 @@ class Converter():
             mat = RenderState.make(matattrib, texattrib)
         elif matid not in self.mat_states:
             print(
-                "Warning: material with name {} has no associated mat state, using an empty RenderState"
-                .format(matid)
+                f"Warning: material with name {matid} has no associated mat state, using an empty RenderState"
             )
             pmat = Material('fallback material')
             matattrib = MaterialAttrib.make(pmat)
@@ -1138,8 +1232,14 @@ class Converter():
             data.append(LVecBase4(gvr.get_data4()))
         return data
 
-    def build_character(self, char, nodeid, jvtmap, cvsmap, gltf_data, recurse=True):
+    def build_character(self, charinfo: CharInfo, nodeid, gltf_data, recurse=True):
+        char = charinfo.character
         affected_nodeids = set()
+        jvtmap = charinfo.jvtmap
+        cvsmap = charinfo.cvsmap
+
+        for bundle in char.bundles:
+            bundle.frame_blend_flag = True
 
         if nodeid in self.skeletons:
             skinid = self.skeletons[nodeid]
@@ -1162,7 +1262,7 @@ class Converter():
 
         # Find animations that affect the collected nodes.
         #print("Looking for actions for", skinname, node_ids)
-        if self.settings.animations != 'skip':
+        if not self.settings.skip_animations:
             anims = [
                 (animid, anim)
                 for animid, anim in enumerate(gltf_data.get('animations', []))
@@ -1176,20 +1276,17 @@ class Converter():
             samplers = gltf_anim['samplers']
             channels = gltf_anim['channels']
 
-            # Blender exports the same number of elements in each time parameter, so find
-            # one and assume that the number of elements is the number of frames
-            time_acc_id = samplers[0]['input']
-            time_acc = gltf_data['accessors'][time_acc_id]
-            time_bv = gltf_data['bufferViews'][time_acc['bufferView']]
-            start = time_acc.get('byteOffset', 0) + time_bv.get('byteOffset', 0)
-            end = start + time_acc['count'] * 4
+            time_acc_ids = list({i['input'] for i in samplers})
             time_data = [
-                struct.unpack_from('<f', self.buffers[time_bv['buffer']], idx)[0]
-                for idx in range(start, end, 4)
+                list(self.get_buffer_from_accessor(
+                    gltf_data,
+                    accid
+                ))
+                for accid in time_acc_ids
             ]
-            num_frames = time_acc['count']
-            end_time = time_data[-1]
-            fps = num_frames / time_data[-1] if end_time != 0 else 24
+            max_time = max([max(i) for i in time_data])
+            fps = self.settings.animation_fps
+            num_frames = max(math.ceil(max_time * fps), 1)
 
             bundle_name = char.name
             bundle = AnimBundle(bundle_name, fps, num_frames)
@@ -1207,7 +1304,10 @@ class Converter():
 
             char.add_child(AnimBundleNode(anim_name, bundle))
 
-    def combine_mesh_skin(self, geom_node, jvtmap):
+    def combine_mesh_skin(self, geom_node, charinfo):
+        jvtmap = charinfo.jvtmap
+        if not jvtmap:
+            return
         jvtmap = collections.OrderedDict(sorted(jvtmap.items()))
 
         for geom in geom_node.modify_geoms():
@@ -1229,8 +1329,7 @@ class Converter():
                         jvt = jvtmap[joint]
                     except KeyError:
                         print(
-                            "Could not find joint in jvtmap:\n\tjoint={}\n\tjvtmap={}"
-                            .format(joint, jvtmap)
+                            f"Could not find joint in jvtmap:\n\tjoint={joint}\n\tjvtmap={jvtmap}"
                         )
                         # Don't warn again for this joint.
                         jvt = None
@@ -1247,7 +1346,10 @@ class Converter():
             inverse = net_xform.get_inverse()
             gvd.transform_vertices(inverse.get_mat())
 
-    def combine_mesh_morphs(self, geom_node, meshid, cvsmap):
+    def combine_mesh_morphs(self, geom_node, meshid, charinfo):
+        cvsmap = charinfo.cvsmap
+        if not cvsmap:
+            return
         zero = LVecBase4.zero()
 
         for geom in geom_node.modify_geoms():
@@ -1287,19 +1389,14 @@ class Converter():
         skeleton = PartGroup(bundle, "<skeleton>")
         jvtmap = {}
 
-        bind_mats = []
-        ibmacc = gltf_data['accessors'][gltf_skin['inverseBindMatrices']]
-        ibmbv = gltf_data['bufferViews'][ibmacc['bufferView']]
-        start = ibmacc.get('byteOffset', 0) + ibmbv.get('byteOffset', 0)
-        end = start + ibmacc['count'] * 16 * 4
-        ibmdata = self.buffers[ibmbv['buffer']][start:end]
+        bind_mats = {}
+        if 'inverseBindMatrices' in gltf_skin:
+            ibmdata = self.get_buffer_from_accessor(gltf_data, gltf_skin['inverseBindMatrices'])
 
-        for i in range(ibmacc['count']):
-            mat = struct.unpack_from('<{}'.format('f'*16), ibmdata, i * 16 * 4)
-            #print('loaded', mat)
-            mat = self.load_matrix(mat)
-            mat.invert_in_place()
-            bind_mats.append(mat)
+            for i, matdata in enumerate(ibmdata):
+                mat = self.load_matrix(matdata)
+                mat.invert_in_place()
+                bind_mats[i] = mat
 
         def create_joint(parent, nodeid, transform):
             node = gltf_data['nodes'][nodeid]
@@ -1315,7 +1412,7 @@ class Converter():
             joint_mat = LMatrix4.ident_mat()
             if nodeid in gltf_skin['joints']:
                 joint_index = gltf_skin['joints'].index(nodeid)
-                joint_mat = bind_mats[joint_index]
+                joint_mat = bind_mats.get(joint_index, LMatrix4.ident_mat())
                 self._joint_nodes.add(nodeid)
 
             # glTF uses an absolute bind pose, Panda wants it local
@@ -1359,7 +1456,7 @@ class Converter():
                         num_targets = max(len(targets), num_targets)
 
                 if num_targets > 0:
-                    target_names = gltf_mesh.get('extras', {}).get('targetNames', [])
+                    target_names = get_extras(gltf_mesh).get('targetNames', [])
                     num_targets = max(len(target_names), num_targets)
 
                     if not weights:
@@ -1394,7 +1491,6 @@ class Converter():
         return cvsmap
 
     def build_animation_skeleton(self, character, parent, boneid, num_frames, gltf_anim, gltf_data):
-        samplers = gltf_anim['samplers']
         bone = gltf_data['nodes'][boneid]
         bone_name = bone.get('name', 'bone'+str(boneid))
         channels = [chan for chan in gltf_anim['channels'] if chan['target']['node'] == boneid]
@@ -1402,73 +1498,90 @@ class Converter():
 
         group = AnimChannelMatrixXfmTable(parent, bone_name)
 
-        def get_accessor(path):
-            accessors = [
-                gltf_data['accessors'][samplers[chan['sampler']]['output']]
+        def extract_chan_data(path):
+            samplers = [
+                gltf_anim['samplers'][chan['sampler']]
                 for chan in channels
                 if chan['target']['path'] == path
             ]
-
-            return accessors[0] if accessors else None
-
-        def extract_chan_data(path):
-            acc = get_accessor(path)
-            if not acc:
+            if not samplers:
                 return None
+            sampler = samplers[0]
 
-            buff_view = gltf_data['bufferViews'][acc['bufferView']]
-            buff_data = self.buffers[buff_view['buffer']]
-            start = acc.get('byteOffset', 0) + buff_view.get('byteOffset', 0)
+            accid = sampler['output']
+            output_buff = list(self.get_buffer_from_accessor(gltf_data, accid))
 
             if path == 'rotation':
-                end = start + acc['count'] * 4 * 4
-                data = [struct.unpack_from('<ffff', buff_data, idx) for idx in range(start, end, 4 * 4)]
-            else:
-                end = start + acc['count'] * 3 * 4
-                data = [struct.unpack_from('<fff', buff_data, idx) for idx in range(start, end, 3 * 4)]
+                output_buff = [p3d.LQuaternion(x[3], x[0], x[1], x[2]) for x in output_buff]
 
-            return data
+            accid = sampler['input']
+            input_buff = self.get_buffer_from_accessor(gltf_data, accid)
+
+            interpolation_mode = sampler.get('interpolation', 'LINEAR')
+            if interpolation_mode == 'CUBICSPLINE':
+                print(
+                    f'Warning: CUBICSPLINE interpolation mode for {bone_name}:{path} is not supported, '
+                    'falling back to LINEAR'
+                )
+                interpolation_mode = 'LINEAR'
+            return list(input_buff), list(output_buff), interpolation_mode
 
         # Create default animaton data
         translation = LVector3()
-        rotation = LVector3()
+        rotation_vec = LVector3()
         scale = LVector3()
-        decompose_matrix(self.csxform * joint_mat * self.csxform_inv, scale, rotation, translation, CS_yup_right)
+        decompose_matrix(self.csxform * joint_mat * self.csxform_inv, scale, rotation_vec, translation, CS_yup_right)
+        rotation = LQuaternion()
+        rotation.set_hpr(rotation_vec, CS_yup_right)
 
         # Override defaults with any found animation data
-        loc_data = extract_chan_data('translation')
-        rot_data = extract_chan_data('rotation')
-        scale_data = extract_chan_data('scale')
+        default_anim_data = {
+            'translation': translation,
+            'rotation': rotation,
+            'scale': scale,
+        }
+        anim_data = {
+            path: extract_chan_data(path)
+            for path in ['translation', 'rotation', 'scale']
+        }
 
         loc_vals = [[], [], []]
         rot_vals = [[], [], []]
         scale_vals = [[], [], []]
 
-        # Repeat last frame if we don't have enough data for all frames.
-        if loc_data and len(loc_data) < num_frames:
-            loc_data += loc_data[-1:] * (num_frames - len(loc_data))
-        if rot_data and len(rot_data) < num_frames:
-            rot_data += rot_data[-1:] * (num_frames - len(rot_data))
-        if scale_data and len(scale_data) < num_frames:
-            scale_data += scale_data[-1:] * (num_frames - len(scale_data))
+        def calculate_frame_value(frame, path):
+            currtime = frame / self.settings.animation_fps
+            if not anim_data[path]:
+                return default_anim_data[path]
+
+            input_buff, output_buff, interpolation_mode = anim_data[path]
+
+            if len(input_buff) == 1:
+                # no need to interpolate, just return the value
+                return output_buff[0]
+
+            nextidx = get_next_time_index(currtime, input_buff)
+            lastidx = nextidx - 1
+
+            if interpolation_mode == 'STEP':
+                return output_buff[lastidx]
+            elif interpolation_mode == 'LINEAR':
+                nexttime = input_buff[nextidx]
+                lasttime = input_buff[lastidx]
+                lerpfactor = get_lerp_factor(currtime, lasttime, nexttime)
+
+                if path == 'rotation':
+                    return slerp(output_buff[lastidx], output_buff[nextidx], lerpfactor)
+                return vlerp(output_buff[lastidx], output_buff[nextidx], lerpfactor)
+            else:
+                return RuntimeError(
+                    f'Unrecognized interpolation mode ({interpolation_mode}) found on {bone_name}:{path}'
+                )
 
         for i in range(num_frames):
-            if scale_data:
-                frame_scale = scale_data[i]
-            else:
-                frame_scale = scale
-
-            if rot_data:
-                quat = rot_data[i]
-                frame_rotation = LQuaternion(quat[3], quat[0], quat[1], quat[2])
-            else:
-                frame_rotation = LQuaternion()
-                frame_rotation.set_hpr(rotation, CS_yup_right)
-
-            if loc_data:
-                frame_translation = loc_data[i]
-            else:
-                frame_translation = translation
+            frame_translation = calculate_frame_value(i, 'translation')
+            frame_rotation = calculate_frame_value(i, 'rotation')
+            frame_scale = calculate_frame_value(i, 'scale')
 
             mat = LMatrix4(LMatrix4.ident_mat())
             mat *= LMatrix4.scale_mat(frame_scale)
@@ -1491,25 +1604,14 @@ class Converter():
             scale_vals[1].append(frame_scale[1])
             scale_vals[2].append(frame_scale[2])
 
-        # If all frames are the same, we only need to store one frame.
-        if min(loc_vals[0]) == max(loc_vals[0]) and \
-           min(loc_vals[1]) == max(loc_vals[1]) and \
-           min(loc_vals[2]) == max(loc_vals[2]) and \
-           min(rot_vals[0]) == max(rot_vals[0]) and \
-           min(rot_vals[1]) == max(rot_vals[1]) and \
-           min(rot_vals[2]) == max(rot_vals[2]) and \
-           min(scale_vals[0]) == max(scale_vals[0]) and \
-           min(scale_vals[1]) == max(scale_vals[1]) and \
-           min(scale_vals[2]) == max(scale_vals[2]):
-            loc_vals[0] = loc_vals[0][:1]
-            loc_vals[1] = loc_vals[1][:1]
-            loc_vals[2] = loc_vals[2][:1]
-            rot_vals[0] = rot_vals[0][:1]
-            rot_vals[1] = rot_vals[1][:1]
-            rot_vals[2] = rot_vals[2][:1]
-            scale_vals[0] = scale_vals[0][:1]
-            scale_vals[1] = scale_vals[1][:1]
-            scale_vals[2] = scale_vals[2][:1]
+        # if all values for a given channel are close enough, we can use the first value for
+        # all frames and save some space
+        def almost_equal(val1, val2):
+            return abs(val2 - val1) < 0.00001
+        for val_arrays in [loc_vals, rot_vals, scale_vals]:
+            for val_array in val_arrays:
+                if almost_equal(min(val_array), max(val_array)):
+                    val_array[:] = val_array[:1]
 
         # Write data to tables
         group.set_table(b'x', CPTA_stdfloat(PTA_stdfloat(loc_vals[0])))
@@ -1531,53 +1633,67 @@ class Converter():
             self.build_animation_skeleton(character, group, childid, num_frames, gltf_anim, gltf_data)
 
     def build_animation_morph(self, parent, nodeid, num_frames, gltf_anim, gltf_data, recurse=True):
-        samplers = gltf_anim['samplers']
-
         def create_channels(parent, nodeid, target_names, default_weights):
             channels = [
                 chan for chan in gltf_anim['channels']
                 if chan['target']['node'] == nodeid and chan['target']['path'] == 'weights'
             ]
 
-            accessors = [
-                gltf_data['accessors'][samplers[chan['sampler']]['output']]
+            samplers = [
+                gltf_anim['samplers'][chan['sampler']]
                 for chan in channels
                 if chan['target']['path'] == 'weights'
             ]
 
-            if accessors:
-                acc = accessors[0]
-                buff_view = gltf_data['bufferViews'][acc['bufferView']]
-                buff_data = self.buffers[buff_view['buffer']]
-                start = acc.get('byteOffset', 0) + buff_view.get('byteOffset', 0)
-
-                end = start + acc['count'] * 4
-                weights = list(CPTAFloat(buff_data[start:end]))
+            if samplers:
+                sampler = samplers[0]
+                buff_data = self.get_buffer_from_accessor(gltf_data, sampler['output'])
+                weights = list(CPTAFloat(buff_data))
+                time_data = self.get_buffer_from_accessor(gltf_data, sampler['input'])
+                interpolation_mode = sampler.get('interpolation', 'LINEAR')
+                if interpolation_mode == 'CUBICSPLINE':
+                    print(
+                        'Warning: CUBICSPLINE interpolation mode for morph targets is not supported, '
+                        'falling back to LINEAR'
+                    )
+                    interpolation_mode = 'LINEAR'
             else:
                 weights = default_weights
+                time_data = [0]
+                interpolation_mode = 'STEP'
 
             num_targets = len(default_weights)
 
             for i, target_name in enumerate(target_names):
-                try:
-                    group = AnimChannelScalarTable(parent, target_name)
-                except TypeError:
-                    # Panda version too old, requires at least 1.10.6.dev5
-                    return
+                group = AnimChannelScalarTable(parent, target_name)
 
                 target_weights = weights[i::num_targets]
+                interpolated_weights = []
 
-                if min(target_weights) == max(target_weights):
+                if len(time_data) == 1 or min(target_weights) == max(target_weights):
                     # If all frames are the same, we only need to store one frame.
-                    target_weights = target_weights[:1]
-                elif len(target_weights) > 1 and len(target_weights) < num_frames:
-                    # If we don't have enough frames, repeat the last value.
-                    target_weights += target_weights[-1:] * (num_frames - len(target_weights))
-                elif len(target_weights) > num_frames:
-                    # We have too many frames.
-                    target_weights = target_weights[:num_frames]
+                    interpolated_weights = target_weights[:1]
+                else:
+                    for frame in range(num_frames):
+                        currtime = frame / self.settings.animation_fps
+                        nextidx = get_next_time_index(currtime, time_data)
+                        lastidx = nextidx - 1
+                        if interpolation_mode == 'STEP':
+                            interpolated_weights.append(target_weights[lastidx])
+                        elif interpolation_mode == 'LINEAR':
+                            lasttime = time_data[lastidx]
+                            nexttime = time_data[nextidx]
+                            lerpfactor = get_lerp_factor(currtime, lasttime, nexttime)
+                            interpolated_weights.append(
+                                target_weights[lastidx] * (1 - lerpfactor)
+                                + target_weights[nextidx] * lerpfactor
+                            )
+                        else:
+                            return RuntimeError(
+                                f'Unrecognized interpolation mode ({interpolation_mode}) found on {target_name}'
+                            )
 
-                group.set_table(CPTA_stdfloat(target_weights))
+                group.set_table(CPTA_stdfloat(interpolated_weights))
 
         gltf_node = gltf_data['nodes'][nodeid]
 
@@ -1586,7 +1702,7 @@ class Converter():
             gltf_mesh = gltf_data['meshes'][meshid]
             weights = gltf_mesh.get('weights')
             if weights:
-                target_names = gltf_mesh.get('extras', {}).get('targetNames', [])
+                target_names = get_extras(gltf_mesh).get('targetNames', [])
                 if len(target_names) < len(weights):
                     target_names += [str(i) for i in range(len(target_names), len(weights))]
 
@@ -1638,7 +1754,7 @@ class Converter():
             elif ltype == 'spot':
                 node = Spotlight(lightname)
             else:
-                print("Unsupported light type for light with name {}: {}".format(lightname, gltf_light['type']))
+                print(f"Unsupported light type for light with name {lightname}: {gltf_light['type']}")
                 node = PandaNode(lightname)
 
         # Update the light
@@ -1712,7 +1828,7 @@ class Converter():
                     mesh.add_geom(geom)
                 shape = bullet.BulletTriangleMeshShape(mesh, dynamic=not static)
         else:
-            print("Unknown collision shape ({}) for object ({})".format(shape_type, node_name))
+            print(f"Unknown collision shape ({shape_type}) for object ({node_name})")
 
         if shape is not None:
             if intangible:
@@ -1725,7 +1841,7 @@ class Converter():
                 phynode.set_mass(mass)
             return phynode
         else:
-            print("Could not create collision shape for object ({})".format(node_name))
+            print(f"Could not create collision shape for object ({node_name})")
 
     def load_physics_builtin(self, node_name, geomnode, shape_type, bounding_box, radius, height, intangible):
         phynode = CollisionNode(node_name)
@@ -1739,11 +1855,9 @@ class Converter():
         elif shape_type in ('CAPSULE', 'CYLINDER', 'CONE'):
             if shape_type != 'CAPSULE':
                 print(
-                    'Warning: builtin collisions do not support shape type {} for object {}, falling back to {}'.format(
-                        shape_type,
-                        node_name,
-                        'CAPSULE'
-                    ))
+                    f'Warning: builtin collisions do not support shape type {shape_type} for object {node_name}, '
+                    'falling back to CAPSULE'
+                )
             half_height = height / 2.0 - radius
             start = LPoint3(0, 0, -half_height)
             end = LPoint3(0, 0, half_height)
@@ -1751,11 +1865,9 @@ class Converter():
         elif shape_type in ('MESH', 'CONVEX_HULL'):
             if shape_type != 'MESH':
                 print(
-                    'Warning: builtin collisions do not support shape type {} for object {}, falling back to {}'.format(
-                        shape_type,
-                        node_name,
-                        'MESH'
-                    ))
+                    f'Warning: builtin collisions do not support shape type {shape_type} for object {node_name}, '
+                    'falling back to MESH'
+                )
             if geomnode:
                 for geom in geomnode.get_geoms():
                     vdata = self.read_vert_data(geom.get_vertex_data(), InternalName.get_vertex())
@@ -1828,7 +1940,7 @@ class Converter():
                     solids.extend(CollisionPolygon(*poly) for poly in polygons)
 
         else:
-            print("Unknown collision shape ({}) for object ({})".format(shape_type, node_name))
+            print(f"Unknown collision shape ({shape_type}) for object ({node_name})")
 
         for solid in solids:
             if intangible:
@@ -1838,87 +1950,4 @@ class Converter():
         if phynode.solids:
             return phynode
         else:
-            print("Could not create collision shape for object ({})".format(node_name))
-
-
-def read_glb_chunk(glb_file):
-    chunk_size, = struct.unpack('<I', glb_file.read(4))
-    chunk_type = glb_file.read(4)
-    chunk_data = glb_file.read(chunk_size)
-    return chunk_type, chunk_data
-
-
-def convert(src, dst, settings=None):
-    if settings is None:
-        settings = GltfSettings()
-
-    if not isinstance(src, Filename):
-        src = Filename.from_os_specific(src)
-
-    if not isinstance(dst, Filename):
-        dst = Filename.from_os_specific(dst)
-
-    indir = Filename(src.get_dirname())
-    outdir = Filename(dst.get_dirname())
-
-    get_model_path().prepend_directory(indir)
-    get_model_path().prepend_directory(outdir)
-
-    converter = Converter(indir=indir, outdir=outdir, settings=settings)
-
-    with open(src, 'rb') as glb_file:
-        if glb_file.read(4) == b'glTF':
-            version, = struct.unpack('<I', glb_file.read(4))
-            if version != 2:
-                raise RuntimeError("Only GLB version 2 is supported, file is version {0}".format(version))
-
-            length, = struct.unpack('<I', glb_file.read(4))
-
-            chunk_type, chunk_data = read_glb_chunk(glb_file)
-            assert chunk_type == b'JSON'
-            gltf_data = json.loads(chunk_data.decode('utf-8'))
-
-            if glb_file.tell() < length:
-                #if read_bytes % 4 != 0:
-                #    glb_file.read((4 - read_bytes) % 4)
-                chunk_type, chunk_data = read_glb_chunk(glb_file)
-                assert chunk_type == b'BIN\000'
-                converter.buffers[0] = chunk_data
-
-            converter.update(gltf_data, writing_bam=True)
-        else:
-            # Re-open as a text file.
-            glb_file.close()
-
-            with open(src) as gltf_file:
-                gltf_data = json.load(gltf_file)
-                converter.update(gltf_data, writing_bam=True)
-
-    if settings.print_scene:
-        converter.active_scene.ls()
-
-    if settings.animations == 'separate':
-        for bundlenode in converter.active_scene.find_all_matches('**/+AnimBundleNode'):
-            anim_name = bundlenode.node().name
-            anim_dst = dst.get_fullpath_wo_extension() \
-                + f'_{anim_name}.' \
-                + dst.get_extension()
-            bundlenode.write_bam_file(anim_dst)
-            bundlenode.removeNode()
-    converter.active_scene.write_bam_file(dst)
-
-
-def load_model(loader, file_path, gltf_settings=None, **loader_kwargs):
-    '''Load a glTF file from file_path and return a ModelRoot'''
-
-    with tempfile.NamedTemporaryFile(suffix='.bam') as bamfile:
-        try:
-            bamfilepath = Filename.from_os_specific(bamfile.name)
-            bamfilepath.make_true_case()
-            convert(file_path, bamfilepath, gltf_settings)
-            if hasattr(loader, 'load_sync'):
-                return loader.load_sync(bamfilepath, **loader_kwargs)
-            else:
-                return loader.load_model(bamfilepath, **loader_kwargs)
-        except:
-            raise RuntimeError("Failed to convert glTF file")
+            print(f"Could not create collision shape for object ({node_name})")
